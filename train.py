@@ -33,7 +33,7 @@ def train(config_path):
     optimizer = optim.Adam(model.parameters(), lr=config['train']['learning_rate'])
 
     n_epochs = config['train']['n_epochs']
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+    # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
     for epoch in range(1, n_epochs + 1):
         model.train()
@@ -55,7 +55,7 @@ def train(config_path):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            scheduler.step()
+    
 
             train_pbar.set_postfix({'loss': loss.item()})
 
