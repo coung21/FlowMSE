@@ -2,7 +2,7 @@
 
 wandb:
   project_name: FlowMSE
-  run_name: debug-run
+  run_name: train-run
 
 train:
   learning_rate: 1.0e-3

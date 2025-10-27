@@ -19,9 +19,9 @@ def train(config_path):
 
     print("Using device:", device)
 
-    # wandb.init(project=config['wandb']['project_name'],
-            #    name=config['wandb']['run_name'],
-                # config=config)
+    wandb.init(project=config['wandb']['project_name'],
+               name=config['wandb']['run_name'],
+                config=config)
 
     print("Loading data...")
     dataloader = get_dataloader(config=config, mode='train')
@@ -59,7 +59,7 @@ def train(config_path):
 
             train_pbar.set_postfix({'loss': loss.item()})
 
-            # wandb.log({'train/loss': loss.item()})
+            wandb.log({'train/loss': loss.item()})
     # Ensure save directory exists
     save_dir = config['train']['save_path']
     os.makedirs(save_dir, exist_ok=True)
@@ -67,7 +67,7 @@ def train(config_path):
     torch.save(model.state_dict(), save_file)
     print("Model saved to", save_file)
 
-    # wandb.finish()
+    wandb.finish()
 
 
 if __name__ == "__main__":
