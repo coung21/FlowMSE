@@ -1,0 +1,6 @@
+/data/dataset/
+/data/demand/
+data/vivos
+*.zip
+__pycache__/
+/wandb/
