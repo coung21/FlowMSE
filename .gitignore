@@ -4,3 +4,5 @@ data/vivos
 *.zip
 __pycache__/
 /wandb/
+*.pth
+*.pt

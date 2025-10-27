@@ -91,6 +91,9 @@ class UNet(nn.Module):
         super(UNet, self).__init__()
 
         self.time_mlp = SinusoidalTimeEmbedding(time_emb_dim)
+        #freeze time embedding parameters
+        for param in self.time_mlp.parameters():
+            param.requires_grad = False
 
         # Encoder
         self.inc = ConvBlock(in_channels, n_features, time_emb_dim)  # [B, 2, F, T] -> [B, 64, F, T]
