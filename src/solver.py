@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from tqdm import tqdm
+# from tqdm import tqdm
 
 @torch.no_grad()
 def euler_solver(model: torch.nn.Module, x: torch.Tensor, num_steps: int = 20, t_start: float = 0.0, t_end: float = 1.0) -> torch.Tensor:
@@ -23,8 +23,8 @@ def euler_solver(model: torch.nn.Module, x: torch.Tensor, num_steps: int = 20, t
     
     x_t = x.clone()
 
-    for i in tqdm(range(num_steps), desc="Euler ODE Solver"):
-        
+    for i in range(num_steps):
+
         t_current = time_steps[i]
 
         t_tensor = torch.full((x.shape[0],), t_current, device=x.device)
