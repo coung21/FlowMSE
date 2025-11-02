@@ -3,7 +3,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 @torch.no_grad()
-def euler_solver(model: torch.nn.Module, x: torch.Tensor, num_steps: int, t_start: float = 0.0, t_end: float = 1.0) -> torch.Tensor:
+def euler_solver(model: torch.nn.Module, x: torch.Tensor, num_steps: int = 20, t_start: float = 0.0, t_end: float = 1.0) -> torch.Tensor:
     """
     Perform Euler method to solve ODE defined by the model.
 

@@ -1,7 +1,15 @@
 torch
 torchaudio
-torchcodec
+torchcodec # conda install -c conda-forge ffmpeg
 tqdm
 wandb
 librosa
 soundfile
+torchmetrics
+numpy
+pandas
+matplotlib
+pyyaml
+pesq
+pystoi
+onnxruntime

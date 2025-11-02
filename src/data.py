@@ -16,7 +16,7 @@ class STFTTransform:
         window = self.window.to(waveform.device)
 
         stft_result = torch.stft(
-            waveform,
+            waveform, 
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             win_length=self.win_length,
@@ -29,7 +29,7 @@ class STFTTransform:
         return stft_result
         
 
-class SEDataset(Dataset):
+class TrainDataset(Dataset):
     def __init__(self, clean_dir, noisy_dir, transform, sample_rate=16000, target_length=None):
         self.clean_dir = clean_dir
         self.noisy_dir = noisy_dir
@@ -80,6 +80,48 @@ class SEDataset(Dataset):
         return source_spec, target_spec # (freq_bins, time_frames)
     
 
+class EvalDataset(Dataset):
+    def __init__(self, clean_dir, noisy_dir, sample_rate=16000):
+        self.clean_dir = clean_dir
+        self.noisy_dir = noisy_dir
+        self.sample_rate = sample_rate
+
+        self.file_list = [f for f in os.listdir(self.clean_dir) if f.endswith('.wav')]
+
+        if not self.file_list:
+            raise ValueError("No .wav files found in the specified clean directory.")
+        
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        file_name = self.file_list[idx]
+
+        clean_path = os.path.join(self.clean_dir, file_name)
+        noisy_path = os.path.join(self.noisy_dir, file_name)
+
+        try:
+            clean_waveform, sr_clean = torchaudio.load(clean_path)
+            noisy_waveform, sr_noisy = torchaudio.load(noisy_path)
+        except Exception as e:
+            raise RuntimeError(f"Error loading audio files: {e}")
+
+        if sr_clean != self.sample_rate:
+            clean_waveform = torchaudio.transforms.Resample(orig_freq=sr_clean, new_freq=self.sample_rate)(clean_waveform)
+        if sr_noisy != self.sample_rate:
+            noisy_waveform = torchaudio.transforms.Resample(orig_freq=sr_noisy, new_freq=self.sample_rate)(noisy_waveform)
+
+        if clean_waveform.shape[0] > 1:
+            clean_waveform = torch.mean(clean_waveform, dim=0)
+        if noisy_waveform.shape[0] > 1:
+            noisy_waveform = torch.mean(noisy_waveform, dim=0)
+
+        clean_waveform = clean_waveform.squeeze(0)
+        noisy_waveform = noisy_waveform.squeeze(0) 
+
+        return clean_waveform, noisy_waveform # (T,), (T,)
+
+
 def get_dataloader(config, mode='train'):
     if mode == 'train':
         cfg = config['train']
@@ -91,12 +133,9 @@ def get_dataloader(config, mode='train'):
         stft_cfg = cfg['stft']
 
 
-    try:
-        duration_sec = data_cfg['duration_sec']
-        sample_rate = data_cfg.get('sample_rate', 16000)
-        target_length = int(duration_sec * sample_rate)
-    except KeyError as e:
-        raise KeyError(f"Missing required data configuration key: {e}")
+    duration_sec = data_cfg['duration_sec']
+    sample_rate = data_cfg.get('sample_rate', 16000)
+    target_length = int(duration_sec * sample_rate)
 
     transform = STFTTransform(
         n_fft=stft_cfg['n_fft'],
@@ -104,13 +143,20 @@ def get_dataloader(config, mode='train'):
         win_length=stft_cfg['win_length']
     )
 
-    ds = SEDataset(
-        clean_dir=data_cfg['clean_dir'],
-        noisy_dir=data_cfg['noisy_dir'],
-        transform=transform,
-        sample_rate=data_cfg.get('sample_rate', 16000),
+    if mode == 'train':
+        ds = TrainDataset(
+            clean_dir=data_cfg['clean_dir'],
+            noisy_dir=data_cfg['noisy_dir'],
+            transform=transform,
+            sample_rate=data_cfg.get('sample_rate', 16000),
         target_length=target_length
-    )
+        )
+    else:
+        ds = EvalDataset(
+            clean_dir=data_cfg['clean_dir'],
+            noisy_dir=data_cfg['noisy_dir'],
+            sample_rate=data_cfg.get('sample_rate', 16000)
+        )
 
     dataloader = DataLoader(
         dataset=ds,
