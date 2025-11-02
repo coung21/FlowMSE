@@ -180,7 +180,7 @@ def evaluate(args):
     wandb.summary['eval/final_si_snr'] = avg_si_snr
     wandb.summary['eval/final_si_sdr'] = avg_si_sdr
     wandb.summary['eval/final_dnsmos'] = avg_dnsmos
-    # wandb.summary['device'] = str(device)
+    wandb.summary['device'] = str(device)
     wandb.summary['checkpoint'] = args.checkpoint
     wandb.finish()
 
@@ -190,7 +190,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to the config file.')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to the model checkpoint.')
-    parser.add_argument('--run_name', type=str, default=None, help='Optional W&B run name for evaluation.')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='Optional W&B run name for evaluation.')
     args = parser.parse_args()
 
     evaluate(args)
