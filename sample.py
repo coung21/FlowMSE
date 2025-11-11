@@ -3,13 +3,30 @@ import os
 import torch.nn as nn
 import torchaudio
 import yaml
-from src.solver import euler_solver
-from src.model import UNet
+from src.model import ConvVAE
 from src.data import STFTTransform
 import argparse 
 
+
+def _complex_to_2channels(spec: torch.Tensor) -> torch.Tensor:
+    """Convert complex STFT [F, T] or [B, F, T] to 2-channel real/imag [1, 2, F, T]."""
+    if spec.dim() == 2:
+        F, T = spec.shape
+        real, imag = spec.real, spec.imag
+        return torch.stack([real, imag], dim=0).unsqueeze(0)  # [1, 2, F, T]
+    elif spec.dim() == 3:
+        # [B, F, T] -> [B, 2, F, T]
+        real, imag = spec.real, spec.imag
+        return torch.stack([real, imag], dim=1)
+    else:
+        raise ValueError(f"Unexpected spec shape {spec.shape}")
+
+
+def _floor_to_multiple(x: int, m: int) -> int:
+    return x - (x % m)
+
 @torch.no_grad()
-def inference(model, stft_transform, solver, noisy_waveform, config): 
+def inference(model, stft_transform, noisy_waveform, config): 
     model.eval()
 
     device = next(model.parameters()).device
@@ -20,18 +37,25 @@ def inference(model, stft_transform, solver, noisy_waveform, config):
     cfg_stft = config['stft']
 
     target_samples = int(cfg_data['sample_rate'] * cfg_data['duration_sec'])
-    hop_length = cfg_stft['hop_length']
-
-    chunk_len_frames = (target_samples // hop_length) + 1
+    # Derive chunk length in STFT frames the same way as training by running a dummy STFT
+    dummy = torch.zeros(target_samples, device=device)
+    dummy_spec = stft_transform(dummy)
+    chunk_len_frames = dummy_spec.shape[-1]
+    # Ensure time dimension divisible by 16 for the VAE
+    chunk_len_frames = _floor_to_multiple(chunk_len_frames, 16)
     overlap_frames = chunk_len_frames // 2
     step_frames = chunk_len_frames - overlap_frames
 
     orig_length = noisy_waveform.shape[0]
 
     noisy_spec = stft_transform(noisy_waveform) # [F, T]
-    noisy_spec = torch.stack([noisy_spec.real, noisy_spec.imag], dim=0).unsqueeze(0) # [1, 2, F, T]
+    # Convert to [1, 2, F, T]
+    noisy_spec = _complex_to_2channels(noisy_spec)  # [1, 2, F, T]
 
     B, C, F, T = noisy_spec.shape
+
+    # Frequency bins expected by model: floor to multiple of 16 (drop highest bin if needed)
+    target_F = _floor_to_multiple(F, 16)
 
     pad_long_file = (step_frames - (T - overlap_frames) % step_frames) % step_frames
 
@@ -53,14 +77,13 @@ def inference(model, stft_transform, solver, noisy_waveform, config):
 
     for start_frame in range(0, T_padded - overlap_frames, step_frames):
         end_frame = start_frame + chunk_len_frames
-        chunk_in = noisy_spec_padded[:, :, :, start_frame:end_frame] # [1, 2, F, chunk_len_frames]
-        chunk_out = solver(
-           model=model,
-           x=chunk_in
-       )
+        chunk_in = noisy_spec_padded[:, :, :target_F, start_frame:end_frame] # [1, 2, target_F, chunk_len]
 
-        out_spec[:, :, :, start_frame:end_frame] += chunk_out * fade_window
-        window_sum[:, :, :, start_frame:end_frame] += fade_window
+        # Forward pass through VAE
+        chunk_out, _, _ = model(chunk_in)
+
+        out_spec[:, :, :target_F, start_frame:end_frame] += chunk_out * fade_window
+        window_sum[:, :, :target_F, start_frame:end_frame] += fade_window
 
     window_sum = torch.where(window_sum == 0, 1.0, window_sum)
     final_out_spec = out_spec / window_sum
@@ -92,23 +115,35 @@ def main(args):
 
     SR = config['data']['sample_rate']
 
-    model = UNet(
+    # Build STFT first to determine shapes
+    stft_transform = STFTTransform(
+        n_fft=config['stft']['n_fft'],
+        hop_length=config['stft']['hop_length'],
+        win_length=config['stft']['win_length'],
+    )
+
+    # Determine model input sizes (F,T) from config
+    target_samples = int(config['data']['sample_rate'] * config['data']['duration_sec'])
+    dummy = torch.zeros(target_samples)
+    dummy_spec = stft_transform(dummy)
+    F_orig, T_dummy = dummy_spec.shape
+    target_F = _floor_to_multiple(F_orig, 16)
+    target_T = _floor_to_multiple(T_dummy, 16)
+
+    model = ConvVAE(
         in_channels=2,
         out_channels=2,
+        n_features=64,
+        z_dim=128,
+        input_f=target_F,
+        input_t=target_T,
     ).to(device)
-
 
     state_dict = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(state_dict)
 
     model.eval()
     print(f'Model loaded from {args.checkpoint}')
-
-    stft_transform = STFTTransform(
-        n_fft=config['stft']['n_fft'],
-        hop_length=config['stft']['hop_length'],
-        win_length=config['stft']['win_length'],
-    )
 
     noisy_waveform, sr = torchaudio.load(args.input)  # [1, T]
 
@@ -159,7 +194,6 @@ def main(args):
     enhenced_waveform = inference(
         model=model,
         stft_transform=stft_transform,
-        solver=euler_solver,
         noisy_waveform=noisy_waveform,
         config=config
     )

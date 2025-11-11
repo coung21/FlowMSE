@@ -1,8 +1,7 @@
 from src.data import get_dataloader
 import argparse
 import torch
-from src.model import UNet
-from src.solver import euler_solver
+from src.model import ConvVAE
 from src.data import STFTTransform
 from sample import inference
 import yaml
@@ -38,6 +37,10 @@ si_snr = ScaleInvariantSignalNoiseRatio() # 1d waveform [T]
 si_sdr = ScaleInvariantSignalDistortionRatio() # 1d waveform [T]
 dnsmos = DeepNoiseSuppressionMeanOpinionScore(16000, False) # output: [5]: [p808_mos, mos_sig, mos_bak, mos_ovr]
 
+def _floor_to_multiple(x: int, m: int) -> int:
+    return x - (x % m)
+
+
 def evaluate(args):
     with open(args.config, 'r') as f:
         full_config = yaml.safe_load(f)
@@ -53,11 +56,31 @@ def evaluate(args):
     wandb.init(project=project, name=run_name, config=full_config)
 
 
-    model = UNet(
+    # Build STFT first to determine model input shapes
+    config = full_config['test']
+    stft_transform = STFTTransform(
+        n_fft=config['stft']['n_fft'],
+        hop_length=config['stft']['hop_length'],
+        win_length=config['stft']['win_length'],
+    )
+
+    # Infer input_f, input_t from configured duration and STFT params
+    target_samples = int(config['data']['sample_rate'] * config['data']['duration_sec'])
+    dummy = torch.zeros(target_samples)
+    dummy_spec = stft_transform(dummy)
+    F_orig, T_dummy = dummy_spec.shape
+    target_F = _floor_to_multiple(F_orig, 16)
+    target_T = _floor_to_multiple(T_dummy, 16)
+
+    # Create ConvVAE and load checkpoint
+    model = ConvVAE(
         in_channels=2,
         out_channels=2,
+        n_features=64,
+        z_dim=128,
+        input_f=target_F,
+        input_t=target_T,
     ).to(device)
-
 
     state_dict = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(state_dict)
@@ -67,13 +90,6 @@ def evaluate(args):
 
 
     eval_loader = get_dataloader(full_config, mode='test')
-
-    config = full_config['test']
-    stft_transform = STFTTransform(
-        n_fft=config['stft']['n_fft'],
-        hop_length=config['stft']['hop_length'],
-        win_length=config['stft']['win_length'],
-    )
 
 
 
@@ -95,7 +111,6 @@ def evaluate(args):
 
         enhanced_waveform = inference(
             model=model,
-            solver=euler_solver,
             stft_transform=stft_transform,
             noisy_waveform=noisy_waveform,
             config=config
