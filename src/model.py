@@ -104,9 +104,23 @@ class ConvVAE(nn.Module):
         return recon_clean, mu, log_var
    
 
-def loss_function(recon_clean_spec, clean_spec_target, mu, log_var, beta):
+def loss_function(recon_clean_spec, clean_spec_target, mu, log_var, beta, reduction: str = 'mean'):
+    """
+    Beta-VAE loss.
+    - Recon term: MSE between recon and target.
+      Use reduction='mean' by default to avoid scale explosion with large spectrograms.
+    - KL term: averaged per-sample over latent dims, then averaged over batch (mean).
+    """
+    if reduction not in {'mean', 'sum'}:
+        raise ValueError("reduction must be 'mean' or 'sum'")
 
-    MSE = F.mse_loss(recon_clean_spec, clean_spec_target, reduction='sum')
-    KLD = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+    # Reconstruction loss
+    MSE = F.mse_loss(recon_clean_spec, clean_spec_target, reduction=reduction)
+
+    # KL divergence per-sample: 0.5 * sum( mu^2 + exp(log_var) - 1 - log_var )
+    # Using the equivalent form below:
+    KLD_per_sample = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
+    KLD = KLD_per_sample.mean() if reduction == 'mean' else KLD_per_sample.sum()
+
     return MSE + beta * KLD
     

@@ -57,6 +57,17 @@ class TrainDataset(Dataset):
         except Exception as e:
             raise RuntimeError(f"Error loading audio files: {e}")
         
+        # Resample if needed
+        if sr_clean != self.sample_rate:
+            clean_waveform = torchaudio.transforms.Resample(orig_freq=sr_clean, new_freq=self.sample_rate)(clean_waveform)
+        if sr_noisy != self.sample_rate:
+            noisy_waveform = torchaudio.transforms.Resample(orig_freq=sr_noisy, new_freq=self.sample_rate)(noisy_waveform)
+
+        # Convert to mono if multi-channel
+        if clean_waveform.shape[0] > 1:
+            clean_waveform = torch.mean(clean_waveform, dim=0, keepdim=True)
+        if noisy_waveform.shape[0] > 1:
+            noisy_waveform = torch.mean(noisy_waveform, dim=0, keepdim=True)
 
         current_len = clean_waveform.shape[1]
 
@@ -69,15 +80,13 @@ class TrainDataset(Dataset):
             clean_waveform = torch.nn.functional.pad(clean_waveform, (0, pad_len))
             noisy_waveform = torch.nn.functional.pad(noisy_waveform, (0, pad_len))
 
-        
-
         clean_waveform = clean_waveform.squeeze(0)
         noisy_waveform = noisy_waveform.squeeze(0)
 
         target_spec = self.transform(clean_waveform)
         source_spec = self.transform(noisy_waveform)
 
-        return source_spec, target_spec # (freq_bins, time_frames)
+        return source_spec, target_spec  # complex tensors with shape (freq_bins, time_frames)
     
 
 class EvalDataset(Dataset):

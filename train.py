@@ -78,6 +78,7 @@ def train(config_path):
     # Optimizer and hyperparams
     optimizer = optim.Adam(model.parameters(), lr=config['train']['learning_rate'])
     beta = config['train'].get('vae_beta', 1e-3)
+    loss_reduction = config['train'].get('loss_reduction', 'mean')
 
     n_epochs = config['train']['n_epochs']
     # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
@@ -97,10 +98,7 @@ def train(config_path):
             optimizer.zero_grad()
 
             recon, mu, log_var = model(noisy)
-            loss = loss_function(recon, clean, mu, log_var, beta)
-
-            # Normalize loss by batch size to stabilize when using sum in loss_function
-            loss = loss / noisy.shape[0]
+            loss = loss_function(recon, clean, mu, log_var, beta, reduction=loss_reduction)
 
             loss.backward()
 
@@ -108,7 +106,12 @@ def train(config_path):
             optimizer.step()
 
             train_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
-            wandb.log({'train/loss': loss.item(), 'train/epoch': epoch})
+            # Optionally log components for diagnostics
+            with torch.no_grad():
+                mse_comp = torch.nn.functional.mse_loss(recon, clean, reduction=loss_reduction).item()
+                # KL as mean over batch for logging
+                kld_comp = (-0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)).mean().item()
+            wandb.log({'train/loss': loss.item(), 'train/mse': mse_comp, 'train/kld': kld_comp, 'train/epoch': epoch})
     # Ensure save directory exists
     save_dir = config['train']['save_path']
     os.makedirs(save_dir, exist_ok=True)
