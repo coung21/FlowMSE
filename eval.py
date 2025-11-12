@@ -1,9 +1,9 @@
 from src.data import get_dataloader
 import argparse
 import torch
-from src.model import SpeechEnhancementVAE
+from src.model import SpeechEnhancementConvAE          # ← dùng ConvAE
 from src.data import STFTTransform
-from sample import inference
+from sample import inference                           # ← hàm đã adapt cho ConvAE
 import yaml
 from tqdm import tqdm
 import os
@@ -29,10 +29,6 @@ si_sdr = ScaleInvariantSignalDistortionRatio()
 dnsmos = DeepNoiseSuppressionMeanOpinionScore(16000, False)  # trả về [p808_mos, mos_sig, mos_bak, mos_ovr, ...]
 
 
-def _floor_to_multiple(x: int, m: int) -> int:
-    return x - (x % m)
-
-
 def evaluate(args):
     with open(args.config, 'r') as f:
         full_config = yaml.safe_load(f)
@@ -40,14 +36,14 @@ def evaluate(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
 
-    # Init W&B
+    # Init W&B (giữ nguyên cách đọc config)
     wb_cfg = (full_config.get('wandb') if isinstance(full_config, dict) else None) or {}
-    project = wb_cfg.get('project_name', 'SpeechEnhancementVAE')
+    project = wb_cfg.get('project_name', 'SpeechEnhancementVAE')  # giữ fallback cũ để không phải sửa config
     default_name = f"eval-{os.path.splitext(os.path.basename(args.checkpoint))[0]}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_name = args.wandb_run_name or wb_cfg.get('run_name') or default_name
     wandb.init(project=project, name=run_name, config=full_config)
 
-    # Build STFT (dùng cho inference)
+    # STFT (dùng cho inference)
     config = full_config['test']
     stft_transform = STFTTransform(
         n_fft=config['stft']['n_fft'],
@@ -55,24 +51,10 @@ def evaluate(args):
         win_length=config['stft']['win_length'],
     )
 
-    # Tạo model SpeechEnhancementVAE và load checkpoint
-    z_dim = full_config.get('train', {}).get('z_dim', 128)  # dùng cùng z_dim như train nếu có
-    model = SpeechEnhancementVAE(z_dim=z_dim).to(device)
-
-    # Load checkpoint with legacy key remap support
+    # Tạo model ConvAE và load checkpoint
+    model = SpeechEnhancementConvAE().to(device)
     raw_state = torch.load(args.checkpoint, map_location=device)
-    remapped = {}
-    legacy_map = {
-        'vae.mu.weight': 'fc_mu.weight',
-        'vae.mu.bias': 'fc_mu.bias',
-        'vae.logvar.weight': 'fc_log_var.weight',
-        'vae.logvar.bias': 'fc_log_var.bias',
-        'vae.fc_dec.weight': 'fc_z.weight',
-        'vae.fc_dec.bias': 'fc_z.bias',
-    }
-    for k, v in raw_state.items():
-        remapped[legacy_map.get(k, k)] = v
-    load_result = model.load_state_dict(remapped, strict=False)
+    load_result = model.load_state_dict(raw_state, strict=False)  # lỏng để tương thích nếu checkpoint có/thiếu vài key
     if load_result.missing_keys:
         print(f"[INFO] Missing keys when loading: {load_result.missing_keys}")
     if load_result.unexpected_keys:
@@ -127,7 +109,6 @@ def evaluate(args):
             try:
                 dnsmos_scores = dnsmos(enh_wav)[3].item()
             except Exception:
-                # dự phòng: nếu API thay đổi, dùng giá trị đầu ra đầu tiên
                 dnsmos_scores = float(dnsmos(enh_wav)[0].item())
 
             # Cộng dồn

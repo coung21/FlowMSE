@@ -3,7 +3,7 @@ import os
 import torch.nn as nn
 import torchaudio
 import yaml
-from src.model import SpeechEnhancementVAE
+from src.model import SpeechEnhancementConvAE   # đổi sang ConvAE
 from src.data import STFTTransform
 import argparse
 
@@ -16,10 +16,26 @@ def _rms(x: torch.Tensor) -> float:
     return float(torch.sqrt(torch.mean(x.float() ** 2)) + 1e-12)
 
 
+def _complex_to_ri(x: torch.Tensor) -> torch.Tensor:
+    """
+    [B, F, T] (complex) -> [B, 2, F, T] (real, imag)
+    """
+    assert torch.is_complex(x), "Expected complex tensor."
+    return torch.stack([x.real, x.imag], dim=1)
+
+
+def _ri_to_complex(x_ri: torch.Tensor) -> torch.Tensor:
+    """
+    [B, 2, F, T] (real, imag) -> [B, F, T] (complex)
+    """
+    assert x_ri.dim() == 4 and x_ri.size(1) == 2, "Expected [B, 2, F, T]."
+    return torch.complex(x_ri[:, 0], x_ri[:, 1])
+
+
 @torch.no_grad()
 def inference(model, stft_transform, noisy_waveform, config):
     """
-    model: SpeechEnhancementVAE (nhận complex STFT [B, F, T])
+    model: SpeechEnhancementConvAE (nhận [B, 2, F, T] thực)
     stft_transform: STFTTransform
     noisy_waveform: tensor [T]
     config: config['test']
@@ -44,7 +60,7 @@ def inference(model, stft_transform, noisy_waveform, config):
     orig_length = noisy_waveform.shape[0]
 
     # STFT phức đầu vào
-    noisy_spec = stft_transform(noisy_waveform).unsqueeze(0)  # [1, F, T]
+    noisy_spec = stft_transform(noisy_waveform).unsqueeze(0)  # [1, F, T] complex
     B, F, T = noisy_spec.shape
 
     # Tần số: cắt về bội số 16 (do kiến trúc stride=2 bốn lần)
@@ -74,16 +90,20 @@ def inference(model, stft_transform, noisy_waveform, config):
         end_frame = start_frame + chunk_len_frames
 
         # Lấy đoạn vào, cắt theo F
-        chunk_in = noisy_spec_padded[:, :target_F, start_frame:end_frame]  # [1, target_F, chunk_len]
+        chunk_in_c = noisy_spec_padded[:, :target_F, start_frame:end_frame]  # [1, target_F, chunk_len] complex
 
-        # Forward qua VAE (làm việc trên complex)
-        chunk_out, _, _ = model(chunk_in)  # [1, target_F, chunk_len], complex
+        # === ConvAE expects [B, 2, F, T] thực ===
+        chunk_in_ri = _complex_to_ri(chunk_in_c)  # [1, 2, target_F, chunk_len]
+
+        # Forward qua ConvAE
+        chunk_out_ri = model(chunk_in_ri)         # [1, 2, target_F, chunk_len]
+        chunk_out_c = _ri_to_complex(chunk_out_ri)  # [1, target_F, chunk_len] complex
 
         # Thống kê debug
-        chunk_means.append(float(chunk_out.abs().mean().item()))
+        chunk_means.append(float(chunk_out_c.abs().mean().item()))
 
         # Áp cửa sổ overlap-add (broadcast theo F)
-        out_spec[:, :target_F, start_frame:end_frame] += chunk_out * fade_window
+        out_spec[:, :target_F, start_frame:end_frame] += chunk_out_c * fade_window
         window_sum[:, :target_F, start_frame:end_frame] += fade_window
 
     # Tránh chia 0
@@ -91,10 +111,10 @@ def inference(model, stft_transform, noisy_waveform, config):
     window_sum_safe = torch.where(window_sum_real == 0, torch.tensor(1.0, device=device), window_sum_real)
     # Chia theo phần thực của trọng số (cửa sổ là thực)
     final_out_spec = out_spec / window_sum_safe
-    final_out_spec = final_out_spec[:, :, :T]  # cắt về chiều T gốc, [1, F, T]
+    final_out_spec = final_out_spec[:, :, :T]  # [1, F, T] (complex), cắt về chiều T gốc
 
     # ISTFT
-    final_out_spec_complex = final_out_spec.squeeze(0)  # [F, T]
+    final_out_spec_complex = final_out_spec.squeeze(0)  # [F, T] complex
     enhanced_waveform = torch.istft(
         final_out_spec_complex,
         n_fft=cfg_stft['n_fft'],
@@ -104,7 +124,7 @@ def inference(model, stft_transform, noisy_waveform, config):
         length=orig_length
     )  # [T]
 
-    # Safety gain: tránh mức âm lượng quá nhỏ
+    # Safety gain
     noisy_rms = _rms(noisy_waveform)
     enh_rms = _rms(enhanced_waveform)
     if enh_rms < 1e-5 and noisy_rms > 0:
@@ -144,40 +164,17 @@ def main(args):
     dummy_spec = stft_transform(dummy)  # [F, T_dummy], complex
     F_orig, T_dummy = dummy_spec.shape
     target_F = _floor_to_multiple(F_orig, 16)
-    target_T = _floor_to_multiple(T_dummy, 16)  # dùng cho chunk_len_frames trong inference
+    target_T = _floor_to_multiple(T_dummy, 16)  # dùng cho chunk_len_frames trong inference (thông tin)
 
     # Tạo model
-    model = SpeechEnhancementVAE(z_dim=128).to(device)
+    model = SpeechEnhancementConvAE().to(device)
 
     # Load checkpoint
     if args.checkpoint:
         raw_state = torch.load(args.checkpoint, map_location=device)
-        # Attempt automatic key remapping for legacy checkpoints
-        remapped = {}
-        legacy_map = {
-            'vae.mu.weight': 'fc_mu.weight',
-            'vae.mu.bias': 'fc_mu.bias',
-            'vae.logvar.weight': 'fc_log_var.weight',
-            'vae.logvar.bias': 'fc_log_var.bias',
-            'vae.fc_dec.weight': 'fc_z.weight',
-            'vae.fc_dec.bias': 'fc_z.bias',
-        }
-        missing_legacy = []
-        for k,v in raw_state.items():
-            if k in legacy_map:
-                remapped[legacy_map[k]] = v
-            else:
-                remapped[k] = v
-        # Load with strict=False to ignore any unmatched old keys
-        load_result = model.load_state_dict(remapped, strict=False)
-        print(f"Model loaded from {args.checkpoint}. Missing keys: {load_result.missing_keys}. Unexpected keys ignored.")
-        # Warn if legacy keys existed but were not all remapped
-        legacy_present = [k for k in raw_state if k in legacy_map]
-        for lk in legacy_present:
-            if legacy_map[lk] not in remapped:
-                missing_legacy.append(lk)
-        if missing_legacy:
-            print(f"[WARN] Unmapped legacy keys: {missing_legacy}")
+        # Load lỏng để tương thích — nếu checkpoint là VAE cũ sẽ có missing/unexpected keys
+        load_result = model.load_state_dict(raw_state, strict=False)
+        print(f"Model loaded from {args.checkpoint}. Missing keys: {load_result.missing_keys}. Unexpected keys: {load_result.unexpected_keys}.")
     else:
         print('[INFO] No checkpoint provided. Using randomly initialized model for inference test.')
 
@@ -232,7 +229,7 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Denoise audio using SpeechEnhancementVAE (complex STFT).')
+    parser = argparse.ArgumentParser(description='Denoise audio using SpeechEnhancementConvAE (complex STFT).')
     parser.add_argument('--config', type=str, required=True, help='Path to the config YAML file.')
     parser.add_argument('--checkpoint', type=str, required=False, default=None, help='Path to the model checkpoint file (optional).')
     parser.add_argument('--input', type=str, required=True, help='Path to the input noisy audio file.')
