@@ -147,13 +147,37 @@ def main(args):
     target_T = _floor_to_multiple(T_dummy, 16)  # dùng cho chunk_len_frames trong inference
 
     # Tạo model
-    model = SpeechEnhancementVAE(z_dim=config['test'].get('z_dim', 128)).to(device)
+    model = SpeechEnhancementVAE(z_dim=128).to(device)
 
     # Load checkpoint
     if args.checkpoint:
-        state_dict = torch.load(args.checkpoint, map_location=device)
-        model.load_state_dict(state_dict)
-        print(f'Model loaded from {args.checkpoint}')
+        raw_state = torch.load(args.checkpoint, map_location=device)
+        # Attempt automatic key remapping for legacy checkpoints
+        remapped = {}
+        legacy_map = {
+            'vae.mu.weight': 'fc_mu.weight',
+            'vae.mu.bias': 'fc_mu.bias',
+            'vae.logvar.weight': 'fc_log_var.weight',
+            'vae.logvar.bias': 'fc_log_var.bias',
+            'vae.fc_dec.weight': 'fc_z.weight',
+            'vae.fc_dec.bias': 'fc_z.bias',
+        }
+        missing_legacy = []
+        for k,v in raw_state.items():
+            if k in legacy_map:
+                remapped[legacy_map[k]] = v
+            else:
+                remapped[k] = v
+        # Load with strict=False to ignore any unmatched old keys
+        load_result = model.load_state_dict(remapped, strict=False)
+        print(f"Model loaded from {args.checkpoint}. Missing keys: {load_result.missing_keys}. Unexpected keys ignored.")
+        # Warn if legacy keys existed but were not all remapped
+        legacy_present = [k for k in raw_state if k in legacy_map]
+        for lk in legacy_present:
+            if legacy_map[lk] not in remapped:
+                missing_legacy.append(lk)
+        if missing_legacy:
+            print(f"[WARN] Unmapped legacy keys: {missing_legacy}")
     else:
         print('[INFO] No checkpoint provided. Using randomly initialized model for inference test.')
 

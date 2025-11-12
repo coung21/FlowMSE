@@ -59,8 +59,24 @@ def evaluate(args):
     z_dim = full_config.get('train', {}).get('z_dim', 128)  # dùng cùng z_dim như train nếu có
     model = SpeechEnhancementVAE(z_dim=z_dim).to(device)
 
-    state_dict = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(state_dict)
+    # Load checkpoint with legacy key remap support
+    raw_state = torch.load(args.checkpoint, map_location=device)
+    remapped = {}
+    legacy_map = {
+        'vae.mu.weight': 'fc_mu.weight',
+        'vae.mu.bias': 'fc_mu.bias',
+        'vae.logvar.weight': 'fc_log_var.weight',
+        'vae.logvar.bias': 'fc_log_var.bias',
+        'vae.fc_dec.weight': 'fc_z.weight',
+        'vae.fc_dec.bias': 'fc_z.bias',
+    }
+    for k, v in raw_state.items():
+        remapped[legacy_map.get(k, k)] = v
+    load_result = model.load_state_dict(remapped, strict=False)
+    if load_result.missing_keys:
+        print(f"[INFO] Missing keys when loading: {load_result.missing_keys}")
+    if load_result.unexpected_keys:
+        print(f"[INFO] Unexpected keys ignored: {load_result.unexpected_keys}")
     model.eval()
     print(f'Model loaded from {args.checkpoint}')
 
