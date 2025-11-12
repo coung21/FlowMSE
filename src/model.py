@@ -1,126 +1,148 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(ConvBlock, self).__init__()
-        self.conv_block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(),
-        )
-    
-    def forward(self, x):
-        return self.conv_block(x)
 
-class DownBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(DownBlock, self).__init__()
-        self.pool = nn.MaxPool2d(2)
-        self.down = ConvBlock(in_channels, out_channels )
+###########################
+# Complex tensor utilities #
+###########################
+def complex_to_ri(X):
+    """complex (B,F,T) -> (B,2,F,T)"""
+    return torch.view_as_real(X).permute(0, 3, 1, 2).contiguous()
 
-    def forward(self, x):
-        x = self.pool(x)
-        return self.down(x)
 
-class UpBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(UpBlock, self).__init__()
-        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-        self.conv = ConvBlock(out_channels, out_channels) 
+def ri_to_complex(X_ri):
+    """(B,2,F,T) -> complex (B,F,T)"""
+    return torch.view_as_complex(X_ri.permute(0, 2, 3, 1).contiguous())
 
-    def forward(self, x1):
-        x1 = self.up(x1)
-        return self.conv(x1)
+
+###########################
+# Convolutional VAE block #
+###########################
+def conv_block(in_ch, out_ch, k=3, s=2, p=1):
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, k, s, p),
+        nn.BatchNorm2d(out_ch),
+        nn.LeakyReLU(0.2, inplace=True),
+    )
+
+
+def deconv_block(in_ch, out_ch, k=4, s=2, p=1):
+    return nn.Sequential(
+        nn.ConvTranspose2d(in_ch, out_ch, k, s, p),
+        nn.BatchNorm2d(out_ch),
+        nn.LeakyReLU(0.2, inplace=True),
+    )
 
 
 class ConvVAE(nn.Module):
-    def __init__(self, in_channels, out_channels, n_features=64, z_dim=128, input_f=256, input_t=128): # type: ignore
-        super(ConvVAE, self).__init__()
+    def __init__(self, z_dim=128, in_ch=2):
+        super().__init__()
+        # --- Encoder ---
+        self.enc = nn.Sequential(
+            conv_block(in_ch, 32),      # /2
+            conv_block(32, 64),         # /4
+            conv_block(64, 128),        # /8
+            conv_block(128, 256),       # /16
+        )
+        self.enc_out_shape = None
+        self.z_dim = z_dim
 
-        # Input: [B, 2, 128, 64]
-        self.inc = ConvBlock(in_channels, n_features) # [B, 64, 128, 64]
-        self.down1 = DownBlock(n_features, n_features * 2)  # [B, 128, 64, 32]
-        self.down2 = DownBlock(n_features * 2, n_features * 4)  # [B, 256, 32, 16]
-        self.down3 = DownBlock(n_features * 4, n_features * 8)  # [B, 512, 16, 8]
-        self.down4 = DownBlock(n_features * 8, n_features * 8)  # [B, 512, 8, 4]
-        
-        # --- VAE Bottleneck ---
-        self.bottleneck_f = input_f // (2**4) # 128 / 16 = 8
-        self.bottleneck_t = input_t // (2**4) # 64 / 16 = 4
-        self.bottleneck_channels = n_features * 8 # 512
-        self.bottleneck_dim = self.bottleneck_channels * self.bottleneck_f * self.bottleneck_t # 512 * 8 * 4 = 16384
-        
-        self.fc_mu = nn.Linear(self.bottleneck_dim, z_dim)
-        self.fc_log_var = nn.Linear(self.bottleneck_dim, z_dim)
-        self.fc_z = nn.Linear(z_dim, self.bottleneck_dim)
+        # Linear layers for latent space (set later after first forward)
+        self.mu = None
+        self.logvar = None
+        self.fc_dec = None
 
-        # Bắt đầu từ bottleneck [B, 512, 8, 4]
-        self.dec_up1 = UpBlock(self.bottleneck_channels, n_features * 8) # [B, 512, 16, 8]
-        self.dec_up2 = UpBlock(n_features * 8, n_features * 4)   # [B, 256, 32, 16]
-        self.dec_up3 = UpBlock(n_features * 4, n_features * 2)   # [B, 128, 64, 32]
-        self.dec_up4 = UpBlock(n_features * 2, n_features)       # [B, 64, 128, 64]
-        
-        self.outc = nn.Conv2d(n_features, out_channels, kernel_size=1) # [B, 2, 128, 64]
+        # --- Decoder (mirror) ---
+        self.dec = nn.Sequential(
+            deconv_block(256, 128),
+            deconv_block(128, 64),
+            deconv_block(64, 32),
+            nn.ConvTranspose2d(32, 2, 4, 2, 1),  # output (B,2,F,T)
+        )
+        self.out_act = nn.Identity()  # could use nn.Tanh() for mask output
 
-    def encode(self, x_noisy):
-        x = self.inc(x_noisy)
-        x = self.down1(x)
-        x = self.down2(x)
-        x = self.down3(x)
-        x5 = self.down4(x)
-        
-        x_flat = torch.flatten(x5, start_dim=1)
-        mu = self.fc_mu(x_flat)
-        log_var = self.fc_log_var(x_flat)
-        return mu, log_var
+    def _build_latent_layers(self, shape, device):
+        flat_dim = torch.prod(torch.tensor(shape)).item()
+        self.mu = nn.Linear(flat_dim, self.z_dim).to(device)
+        self.logvar = nn.Linear(flat_dim, self.z_dim).to(device)
+        self.fc_dec = nn.Linear(self.z_dim, flat_dim).to(device)
+        self.enc_out_shape = shape
 
-    def reparameterize(self, mu, log_var):
-        std = torch.exp(0.5 * log_var)
+    def encode(self, x):
+        h = self.enc(x)
+        if self.enc_out_shape is None:
+            self._build_latent_layers(h.shape[1:], x.device)
+        h_flat = h.flatten(1)
+        mu = self.mu(h_flat)
+        logvar = self.logvar(h_flat)
+        return mu, logvar
+
+    def reparam(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
     def decode(self, z):
-        x = self.fc_z(z)
-        x = x.view(-1, self.bottleneck_channels, self.bottleneck_f, self.bottleneck_t) # Un-flatten
-        
-        x = self.dec_up1(x)
-        x = self.dec_up2(x)
-        x = self.dec_up3(x)
-        x = self.dec_up4(x)
-        
-        recon_clean_spec = self.outc(x) 
-        return recon_clean_spec
+        h = self.fc_dec(z)
+        h = h.view(-1, *self.enc_out_shape)
+        y = self.dec(h)
+        return self.out_act(y)
 
-    def forward(self, x_noisy):
-        mu, log_var = self.encode(x_noisy)
-        z = self.reparameterize(mu, log_var)
-        recon_clean = self.decode(z)
-        return recon_clean, mu, log_var
-   
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparam(mu, logvar)
+        y = self.decode(z)
+        return y, mu, logvar
 
-def loss_function(recon_clean_spec, clean_spec_target, mu, log_var, beta, reduction: str = 'mean'):
+
+#####################
+# Top-level wrapper #
+#####################
+class SpeechEnhancementVAE(nn.Module):
     """
-    Beta-VAE loss.
-    - Recon term: MSE between recon and target.
-      Use reduction='mean' by default to avoid scale explosion with large spectrograms.
-    - KL term: averaged per-sample over latent dims, then averaged over batch (mean).
+    Wrapper model: nhận STFT phức của noisy speech
+    → xuất STFT phức của clean speech.
     """
-    if reduction not in {'mean', 'sum'}:
-        raise ValueError("reduction must be 'mean' or 'sum'")
 
-    # Reconstruction loss
-    MSE = F.mse_loss(recon_clean_spec, clean_spec_target, reduction=reduction)
+    def __init__(self, z_dim=128):
+        super().__init__()
+        self.vae = ConvVAE(z_dim=z_dim, in_ch=2)
 
-    # KL divergence per-sample: 0.5 * sum( mu^2 + exp(log_var) - 1 - log_var )
-    # Using the equivalent form below:
-    KLD_per_sample = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
-    KLD = KLD_per_sample.mean() if reduction == 'mean' else KLD_per_sample.sum()
+    def forward(self, noisy_complex):
+        """
+        noisy_complex: complex tensor (B, F, T)
+        Trả về: (reconstructed complex STFT, mu, logvar)
+        """
+        X_ri = complex_to_ri(noisy_complex)  # (B,2,F,T)
+        Y_ri, mu, logvar = self.vae(X_ri)
+        Y_complex = ri_to_complex(Y_ri)
+        return Y_complex, mu, logvar
 
-    return MSE + beta * KLD
-    
+
+#####################
+# Loss definitions  #
+#####################
+def complex_mse(pred, target):
+    """Complex MSE loss"""
+    diff = pred - target
+    return (diff.real.pow(2) + diff.imag.pow(2)).mean()
+
+
+def kl_loss(mu, logvar):
+    """KL divergence for VAE"""
+    return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+
+
+class VAEComplexLoss(nn.Module):
+    """Kết hợp complex MSE và KL"""
+
+    def __init__(self, beta=1e-4):
+        super().__init__()
+        self.beta = beta
+
+    def forward(self, pred_complex, target_complex, mu, logvar):
+        rec = complex_mse(pred_complex, target_complex)
+        kl = kl_loss(mu, logvar)
+        loss = rec + self.beta * kl
+        return loss, rec, kl
