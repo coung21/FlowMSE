@@ -1,11 +1,11 @@
 import torch
 import os
-import torch.nn as nn
 import torchaudio
 import yaml
-from src.model import SpeechEnhancementConvAE   # đổi sang ConvAE
-from src.data import STFTTransform
 import argparse
+
+from src.model import GeneratorConv            # ← dùng Generator của GAN
+from src.data import STFTTransform
 
 
 def _floor_to_multiple(x: int, m: int) -> int:
@@ -35,7 +35,7 @@ def _ri_to_complex(x_ri: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def inference(model, stft_transform, noisy_waveform, config):
     """
-    model: SpeechEnhancementConvAE (nhận [B, 2, F, T] thực)
+    model: GeneratorConv (nhận [B, 2, F, T] thực; trả [B, 2, F, T])
     stft_transform: STFTTransform
     noisy_waveform: tensor [T]
     config: config['test']
@@ -48,12 +48,11 @@ def inference(model, stft_transform, noisy_waveform, config):
     cfg_data = config['data']
     cfg_stft = config['stft']
 
-    # Xác định độ dài khung theo cấu hình training
+    # Suy ra độ dài chunk theo cấu hình train
     target_samples = int(cfg_data['sample_rate'] * cfg_data['duration_sec'])
     dummy = torch.zeros(target_samples, device=device)
     dummy_spec = stft_transform(dummy)  # complex [F, T_dummy]
-    chunk_len_frames = dummy_spec.shape[-1]
-    chunk_len_frames = _floor_to_multiple(chunk_len_frames, 16)  # bội số 16 cho down/up 4 lần
+    chunk_len_frames = _floor_to_multiple(dummy_spec.shape[-1], 16)  # bội 16 vì 4 lần /2
     overlap_frames = chunk_len_frames // 2
     step_frames = chunk_len_frames - overlap_frames
 
@@ -61,62 +60,58 @@ def inference(model, stft_transform, noisy_waveform, config):
 
     # STFT phức đầu vào
     noisy_spec = stft_transform(noisy_waveform).unsqueeze(0)  # [1, F, T] complex
-    B, F, T = noisy_spec.shape
+    _, F, T = noisy_spec.shape
 
-    # Tần số: cắt về bội số 16 (do kiến trúc stride=2 bốn lần)
+    # Bên tần số: cắt về bội số 16
     target_F = _floor_to_multiple(F, 16)
 
-    # Tính padding theo chiều thời gian để quét hết file
+    # Tính padding thời gian để quét hết file
     pad_long_file = (step_frames - (T - overlap_frames) % step_frames) % step_frames
-    pad_short_file = 0
-    if T < chunk_len_frames:
-        pad_short_file = chunk_len_frames - T
+    pad_short_file = max(0, chunk_len_frames - T)
     pad_frames = max(pad_long_file, pad_short_file)
 
-    # Pad theo thời gian
     noisy_spec_padded = torch.nn.functional.pad(noisy_spec, (0, pad_frames))  # [1, F, T']
     T_padded = noisy_spec_padded.shape[-1]
 
-    # Bộ đệm kết quả & trọng số cửa sổ (complex)
-    out_spec = torch.zeros_like(noisy_spec_padded, dtype=noisy_spec_padded.dtype)       # [1, F, T']
-    window_sum = torch.zeros_like(noisy_spec_padded, dtype=noisy_spec_padded.dtype)     # [1, F, T']
+    # Bộ đệm kết quả & trọng số (complex)
+    out_spec = torch.zeros_like(noisy_spec_padded, dtype=noisy_spec_padded.dtype)
+    window_sum = torch.zeros_like(noisy_spec_padded, dtype=noisy_spec_padded.dtype)
 
-    # Cửa sổ chồng lấn theo thời gian
-    fade_window = torch.hann_window(chunk_len_frames, periodic=False).to(device)  # [chunk_len]
-    fade_window = fade_window.view(1, 1, -1)  # [1, 1, chunk_len]
+    # Cửa sổ overlap-add
+    fade_window = torch.hann_window(chunk_len_frames, periodic=False).to(device).view(1, 1, -1)
 
     chunk_means = []
-    for start_frame in range(0, T_padded - overlap_frames, step_frames):
-        end_frame = start_frame + chunk_len_frames
+    for start in range(0, T_padded - overlap_frames, step_frames):
+        end = start + chunk_len_frames
 
-        # Lấy đoạn vào, cắt theo F
-        chunk_in_c = noisy_spec_padded[:, :target_F, start_frame:end_frame]  # [1, target_F, chunk_len] complex
+        # Lấy đoạn vào (complex), cắt F
+        chunk_in_c = noisy_spec_padded[:, :target_F, start:end]  # [1, target_F, L]
+        # → RI cho Generator
+        chunk_in_ri = _complex_to_ri(chunk_in_c)                 # [1, 2, target_F, L]
 
-        # === ConvAE expects [B, 2, F, T] thực ===
-        chunk_in_ri = _complex_to_ri(chunk_in_c)  # [1, 2, target_F, chunk_len]
+        # Forward qua GeneratorConv (residual_out=True → trả phổ đã khử nhiễu)
+        chunk_out_ri = model(chunk_in_ri)                        # [1, 2, target_F, L]
+        chunk_out_c = _ri_to_complex(chunk_out_ri)               # [1, target_F, L] complex
 
-        # Forward qua ConvAE
-        chunk_out_ri = model(chunk_in_ri)         # [1, 2, target_F, chunk_len]
-        chunk_out_c = _ri_to_complex(chunk_out_ri)  # [1, target_F, chunk_len] complex
-
-        # Thống kê debug
+        # Debug thống kê
         chunk_means.append(float(chunk_out_c.abs().mean().item()))
 
-        # Áp cửa sổ overlap-add (broadcast theo F)
-        out_spec[:, :target_F, start_frame:end_frame] += chunk_out_c * fade_window
-        window_sum[:, :target_F, start_frame:end_frame] += fade_window
+        # Overlap-add theo thời gian
+        out_spec[:, :target_F, start:end] += chunk_out_c * fade_window
+        window_sum[:, :target_F, start:end] += fade_window
 
     # Tránh chia 0
     window_sum_real = window_sum.real
-    window_sum_safe = torch.where(window_sum_real == 0, torch.tensor(1.0, device=device), window_sum_real)
-    # Chia theo phần thực của trọng số (cửa sổ là thực)
+    window_sum_safe = torch.where(window_sum_real == 0,
+                                  torch.tensor(1.0, device=device),
+                                  window_sum_real)
     final_out_spec = out_spec / window_sum_safe
-    final_out_spec = final_out_spec[:, :, :T]  # [1, F, T] (complex), cắt về chiều T gốc
+    final_out_spec = final_out_spec[:, :, :T]  # cắt về T gốc
 
     # ISTFT
-    final_out_spec_complex = final_out_spec.squeeze(0)  # [F, T] complex
+    final_c = final_out_spec.squeeze(0)  # [F, T] complex
     enhanced_waveform = torch.istft(
-        final_out_spec_complex,
+        final_c,
         n_fft=cfg_stft['n_fft'],
         hop_length=cfg_stft['hop_length'],
         win_length=cfg_stft['win_length'],
@@ -134,7 +129,7 @@ def inference(model, stft_transform, noisy_waveform, config):
     # Debug
     try:
         avg_mag = sum(chunk_means) / max(1, len(chunk_means))
-        print(f"[inference] chunk_out|mean_abs ~ {avg_mag:.6f}, noisy_rms={noisy_rms:.6f}, enh_rms={_rms(enhanced_waveform):.6f}")
+        print(f"[inference] G-out|mean_abs ~ {avg_mag:.6f}, noisy_rms={noisy_rms:.6f}, enh_rms={_rms(enhanced_waveform):.6f}")
     except Exception:
         pass
 
@@ -151,37 +146,32 @@ def main(args):
 
     SR = config['data']['sample_rate']
 
-    # STFT
+    # STFT (khớp train)
     stft_transform = STFTTransform(
         n_fft=config['stft']['n_fft'],
         hop_length=config['stft']['hop_length'],
         win_length=config['stft']['win_length'],
     )
 
-    # Suy ra F, T từ cấu hình chunk (giống train) — chỉ để kiểm soát chunk_len & target_F
-    target_samples = int(config['data']['sample_rate'] * config['data']['duration_sec'])
-    dummy = torch.zeros(target_samples)
-    dummy_spec = stft_transform(dummy)  # [F, T_dummy], complex
-    F_orig, T_dummy = dummy_spec.shape
-    target_F = _floor_to_multiple(F_orig, 16)
-    target_T = _floor_to_multiple(T_dummy, 16)  # dùng cho chunk_len_frames trong inference (thông tin)
+    # Khởi tạo GeneratorConv (residual_out=True để sinh phổ sạch theo kiểu y = x + r)
+    model = GeneratorConv(residual_out=True).to(device)
 
-    # Tạo model
-    model = SpeechEnhancementConvAE().to(device)
-
-    # Load checkpoint
+    # Load checkpoint (strict=False để chấp nhận khác biệt nhỏ giữa phiên bản)
     if args.checkpoint:
         raw_state = torch.load(args.checkpoint, map_location=device)
-        # Load lỏng để tương thích — nếu checkpoint là VAE cũ sẽ có missing/unexpected keys
         load_result = model.load_state_dict(raw_state, strict=False)
-        print(f"Model loaded from {args.checkpoint}. Missing keys: {load_result.missing_keys}. Unexpected keys: {load_result.unexpected_keys}.")
+        if load_result.missing_keys:
+            print(f"[INFO] Missing keys when loading: {load_result.missing_keys}")
+        if load_result.unexpected_keys:
+            print(f"[INFO] Unexpected keys ignored: {load_result.unexpected_keys}")
+        print(f"Model loaded from {args.checkpoint}")
     else:
-        print('[INFO] No checkpoint provided. Using randomly initialized model for inference test.')
+        print("[INFO] No checkpoint provided. Using randomly initialized Generator for inference test.")
 
     model.eval()
 
     # Load noisy wav
-    noisy_waveform, sr = torchaudio.load(args.input)  # [1, T] or [C, T]
+    noisy_waveform, sr = torchaudio.load(args.input)  # [C, T]
     if sr != SR:
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=SR)
         noisy_waveform = resampler(noisy_waveform)
@@ -229,9 +219,9 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Denoise audio using SpeechEnhancementConvAE (complex STFT).')
+    parser = argparse.ArgumentParser(description='Denoise audio using GAN GeneratorConv (complex STFT).')
     parser.add_argument('--config', type=str, required=True, help='Path to the config YAML file.')
-    parser.add_argument('--checkpoint', type=str, required=False, default=None, help='Path to the model checkpoint file (optional).')
+    parser.add_argument('--checkpoint', type=str, required=False, default=None, help='Path to the Generator checkpoint file (optional).')
     parser.add_argument('--input', type=str, required=True, help='Path to the input noisy audio file.')
     parser.add_argument('--output', type=str, required=True, help='Path to save the enhanced audio file.')
 

@@ -1,9 +1,9 @@
 from src.data import get_dataloader
 import argparse
 import torch
-from src.model import SpeechEnhancementConvAE          # ← dùng ConvAE
+from src.model import GeneratorConv                    # ← dùng Generator của GAN
 from src.data import STFTTransform
-from sample import inference                           # ← hàm đã adapt cho ConvAE
+from sample import inference                           # ← hàm inference đã hỗ trợ GeneratorConv
 import yaml
 from tqdm import tqdm
 import os
@@ -26,7 +26,7 @@ sdr = SignalDistortionRatio()
 snr = SignalNoiseRatio()
 si_snr = ScaleInvariantSignalNoiseRatio()
 si_sdr = ScaleInvariantSignalDistortionRatio()
-dnsmos = DeepNoiseSuppressionMeanOpinionScore(16000, False)  # trả về [p808_mos, mos_sig, mos_bak, mos_ovr, ...]
+dnsmos = DeepNoiseSuppressionMeanOpinionScore(16000, False)  # [p808_mos, mos_sig, mos_bak, mos_ovr, ...]
 
 
 def evaluate(args):
@@ -38,7 +38,7 @@ def evaluate(args):
 
     # Init W&B (giữ nguyên cách đọc config)
     wb_cfg = (full_config.get('wandb') if isinstance(full_config, dict) else None) or {}
-    project = wb_cfg.get('project_name', 'SpeechEnhancementVAE')  # giữ fallback cũ để không phải sửa config
+    project = wb_cfg.get('project_name', 'SpeechEnhancementGAN')  # fallback tên dự án
     default_name = f"eval-{os.path.splitext(os.path.basename(args.checkpoint))[0]}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_name = args.wandb_run_name or wb_cfg.get('run_name') or default_name
     wandb.init(project=project, name=run_name, config=full_config)
@@ -51,16 +51,16 @@ def evaluate(args):
         win_length=config['stft']['win_length'],
     )
 
-    # Tạo model ConvAE và load checkpoint
-    model = SpeechEnhancementConvAE().to(device)
+    # Tạo Generator và load checkpoint của G
+    model = GeneratorConv(residual_out=True).to(device)
     raw_state = torch.load(args.checkpoint, map_location=device)
-    load_result = model.load_state_dict(raw_state, strict=False)  # lỏng để tương thích nếu checkpoint có/thiếu vài key
+    load_result = model.load_state_dict(raw_state, strict=False)  # lỏng để chấp nhận minor diff
     if load_result.missing_keys:
         print(f"[INFO] Missing keys when loading: {load_result.missing_keys}")
     if load_result.unexpected_keys:
         print(f"[INFO] Unexpected keys ignored: {load_result.unexpected_keys}")
     model.eval()
-    print(f'Model loaded from {args.checkpoint}')
+    print(f'Generator loaded from {args.checkpoint}')
 
     # DataLoader eval
     eval_loader = get_dataloader(full_config, mode='test')
@@ -78,14 +78,14 @@ def evaluate(args):
     pbar = tqdm(eval_loader, desc='Evaluating')
 
     for batch_idx, batch in enumerate(pbar, start=1):
-        # Batch của EvalDataset: (clean_waveform, noisy_waveform), mỗi cái là [B, T]
+        # EvalDataset trả (clean_waveform, noisy_waveform), mỗi cái [B, T]
         clean_batch, noisy_batch = batch
         B = clean_batch.shape[0]
         for i in range(B):
             clean_waveform = clean_batch[i].to(device)
             noisy_waveform = noisy_batch[i].to(device)
 
-            # Inference (trả về waveform CPU)
+            # Inference → waveform CPU
             enhanced_waveform = inference(
                 model=model,
                 stft_transform=stft_transform,
@@ -105,7 +105,7 @@ def evaluate(args):
             snr_score = snr(enh_wav, clean_wav).item()
             si_snr_score = si_snr(enh_wav, clean_wav).item()
             si_sdr_score = si_sdr(enh_wav, clean_wav).item()
-            # dnsmos: lấy chỉ số MOS tổng quan (mos_ovr)
+            # dnsmos: lấy MOS tổng quan (mos_ovr) nếu có, fallback phần tử đầu
             try:
                 dnsmos_scores = dnsmos(enh_wav)[3].item()
             except Exception:
@@ -133,7 +133,7 @@ def evaluate(args):
                 'eval/sample_idx_global': num_samples,
             })
 
-        # Cập nhật thanh tiến trình theo trung bình tạm thời
+        # Update progress bar
         denom = max(1, num_samples)
         pbar.set_postfix({
             'PESQ': total_pesq / denom,
@@ -145,7 +145,7 @@ def evaluate(args):
             'DNSMOS': total_dnsmos / denom,
         })
 
-    # Trung bình cuối cùng
+    # Trung bình cuối
     avg_pesq = total_pesq / num_samples
     avg_stoi = total_stoi / num_samples
     avg_sdr = total_sdr / num_samples
@@ -189,7 +189,7 @@ def evaluate(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to the config file.')
-    parser.add_argument('--checkpoint', type=str, required=True, help='Path to the model checkpoint.')
+    parser.add_argument('--checkpoint', type=str, required=True, help='Path to the Generator checkpoint (gan_G_*.pth).')
     parser.add_argument('--wandb_run_name', type=str, default=None, help='Optional W&B run name for evaluation.')
     args = parser.parse_args()
 
